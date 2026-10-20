@@ -23,11 +23,11 @@ def extract_audio(request: LinkRequest):
         'quiet': True,
         'no_warnings': True,
         # ====================================================
-        # FIX: BYPASS THE 406 ERROR BY MIMICKING A REAL BROWSER
+        # FIX: CORRECT KEY FOR YT-DLP TO MASQUERADE AS CHROME
         # ====================================================
-        'http_headers': {
+        'headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,video/webm,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Sec-Fetch-Mode': 'navigate',
         }
