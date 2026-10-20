@@ -22,24 +22,23 @@ def extract_audio(request: LinkRequest):
         'format': 'bestaudio/best',
         'quiet': True,
         'no_warnings': True,
-        # ====================================================
-        # FIX: CORRECT KEY FOR YT-DLP TO MASQUERADE AS CHROME
-        # ====================================================
-        'headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,video/webm,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-        }
+        # Force yt-dlp to natively spoof a real Chrome client
+        'impersonate': 'chrome', 
+        # Prevents getting stuck on broken formats
+        'ignoreerrors': True,    
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
+            
+            if not info:
+                raise HTTPException(status_code=400, detail="Platform blocked extraction. Try a different link format.")
+                
             raw_audio_url = info.get("url")
             
             if not raw_audio_url:
-                raise HTTPException(status_code=400, detail="Could not extract streaming audio URL.")
+                raise HTTPException(status_code=400, detail="Could not isolate raw streaming audio link.")
                 
             return {"status": "success", "audio_url": raw_audio_url}
             
