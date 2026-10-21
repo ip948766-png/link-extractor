@@ -7,6 +7,7 @@ import tempfile
 import ipaddress
 import mimetypes
 import time
+import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,10 +28,13 @@ MAX_AUDIO_BYTES = MAX_AUDIO_MB * 1024 * 1024
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
 AUDIO_TTL_SECONDS = 1800
 
+# Base64 encoded Netscape format YouTube cookie string (optional)
+YOUTUBE_COOKIES_BASE64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
+
 CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Audio Extraction API", version="2.0.2")
+app = FastAPI(title="Audio Extraction API", version="2.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,150 +130,112 @@ def cleanup_old_audio():
 
 
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
-    """Download audio track from supported video URL using yt-dlp."""
-    opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 2,
-        "fragment_retries": 2,
-        "max_filesize": MAX_AUDIO_BYTES,
-        
-        # ====================================================
-        # FIX: MASK AS CHROME DESKTOP WITHOUT EXT-DEPENDENCIES
-        # ====================================================
-        "extractor_args": {
-            "youtube": {
-                "client": ["mweb", "android"]  # Uses lighter client profiles
-            }
-        },
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/webm,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
-        },
-        "ignoreerrors": True
-    }
+    """Download audio track with bot detection bypass strategies for cloud servers."""
+    
+    # Handle optional youtube cookies passed via environment variable
+    cookiefile_path = None
+    if YOUTUBE_COOKIES_BASE64:
+        try:
+            cookie_data = base64.b64decode(YOUTUBE_COOKIES_BASE64).decode("utf-8")
+            cookiefile_path = os.path.join(output_dir, "cookies.txt")
+            with open(cookiefile_path, "w", encoding="utf-8") as f:
+                f.write(cookie_data)
+        except Exception as exc:
+            logger.warning("Failed to parse YOUTUBE_COOKIES_BASE64: %s", exc)
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    # Sequence of player clients to attempt when Cloud Datacenter IPs get flagged
+    client_strategies = [
+        ["tv_downgraded", "mweb", "android_vr"],
+        ["android", "ios"],
+        ["web_embedded", "mweb"]
+    ]
 
-            if not info:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The platform did not return video information.",
-                )
+    last_exception = None
 
-            duration = info.get("duration")
+    for client_list in client_strategies:
+        opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
+            "max_filesize": MAX_AUDIO_BYTES,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": client_list
+                }
+            },
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            "ignoreerrors": True
+        }
 
-            if duration and duration > MAX_DURATION_SECONDS:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Video exceeds the configured duration limit.",
-                )
+        if cookiefile_path and os.path.exists(cookiefile_path):
+            opts["cookiefile"] = cookiefile_path
 
-            estimated_size = (
-                info.get("filesize")
-                or info.get("filesize_approx")
-            )
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-            if estimated_size and estimated_size > MAX_AUDIO_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
-                )
+                if not info:
+                    continue
 
-            ydl.download([url])
+                duration = info.get("duration")
+                if duration and duration > MAX_DURATION_SECONDS:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Video exceeds the configured duration limit.",
+                    )
 
-        candidates = [
-            path for path in Path(output_dir).iterdir()
-            if path.is_file()
-            and path.suffix.lower() in AUDIO_EXTENSIONS
-            and not path.name.endswith((".part", ".ytdl"))
-        ]
+                estimated_size = info.get("filesize") or info.get("filesize_approx")
+                if estimated_size and estimated_size > MAX_AUDIO_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
+                    )
 
-        if not candidates:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "No supported audio file was produced. "
-                    "The video may be restricted or the platform "
-                    "may have changed its extraction requirements."
-                ),
-            )
+                ydl.download([url])
 
-        audio_file = max(
-            candidates,
-            key=lambda path: path.stat().st_size,
+            candidates = [
+                path for path in Path(output_dir).iterdir()
+                if path.is_file()
+                and path.suffix.lower() in AUDIO_EXTENSIONS
+                and not path.name.endswith((".part", ".ytdl"))
+                and path.name != "cookies.txt"
+            ]
+
+            if candidates:
+                audio_file = max(candidates, key=lambda path: path.stat().st_size)
+                audio_path = str(audio_file)
+                size = os.path.getsize(audio_path)
+
+                if size > 0 and size <= MAX_AUDIO_BYTES:
+                    return audio_path, info
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exception = exc
+            logger.warning("yt-dlp strategy %s failed: %r", client_list, exc)
+            continue
+
+    logger.exception("All yt-dlp extraction strategies failed: %r", last_exception)
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "YouTube bot verification check failed on host server. "
+            "Please try again or configure YOUTUBE_COOKIES_BASE64 in your Render settings."
         )
-        audio_path = str(audio_file)
-        size = os.path.getsize(audio_path)
-
-        if size == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="The extracted audio file is empty.",
-            )
-
-        if size > MAX_AUDIO_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
-            )
-
-        return audio_path, info
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        logger.exception("yt-dlp extraction failed: %r", exc)
-        message = str(exc).lower()
-
-        if any(term in message for term in (
-            "private video",
-            "video is private",
-            "login required",
-            "sign in to confirm",
-            "members-only",
-        )):
-            detail = (
-                "This video may require login or may be private. "
-                "Try a publicly accessible video."
-            )
-
-        elif "unsupported url" in message:
-            detail = (
-                "This URL is not supported by the installed yt-dlp version."
-            )
-
-        elif any(term in message for term in (
-            "403", "406", "forbidden", "http error 429",
-        )):
-            detail = (
-                "The platform rejected the extraction request. "
-                "Check the Render logs for details."
-            )
-
-        elif "too large" in message or "max-filesize" in message:
-            detail = f"Audio exceeds the {MAX_AUDIO_MB} MB limit."
-
-        else:
-            detail = (
-                "Audio extraction failed. Check the Render logs "
-                "for the underlying error."
-            )
-
-        raise HTTPException(status_code=502, detail=detail)
+    )
 
 
 def transcribe_with_groq(audio_path: str) -> dict:
-    """Send local audio stream to Groq Audio Transcriptions API."""
+    """Send local audio file stream to Groq Audio Transcriptions API."""
     if not GROQ_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -332,7 +298,7 @@ def transcribe_with_groq(audio_path: str) -> dict:
 
 @app.post("/extract-audio")
 async def handle_extraction_and_transcription(request: LinkRequest):
-    """Main endpoint to accept video URL, extract audio, and return transcript."""
+    """Main API endpoint to accept video URL, extract audio, and return transcript."""
     cleanup_old_audio()
     validated_url = validate_video_url(request.url)
 
