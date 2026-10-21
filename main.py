@@ -1,3 +1,4 @@
+
 import os
 import re
 import uuid
@@ -36,7 +37,7 @@ AUDIO_TTL_SECONDS = 1800
 CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Audio Extraction API", version="2.0.1")
+app = FastAPI(title="Audio Extraction API", version="2.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,8 +73,9 @@ class LinkRequest(BaseModel):
 # --------------------------------------------------
 
 def validate_video_url(raw_url: str) -> str:
+    cleaned_url = raw_url.strip()
+
     try:
-        cleaned_url = raw_url.strip()
         parsed = urlparse(cleaned_url)
         hostname = (parsed.hostname or "").lower().rstrip(".")
 
@@ -88,10 +90,10 @@ def validate_video_url(raw_url: str) -> str:
 
         try:
             ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
             raise ValueError("IP-address URLs are not accepted.")
-        except ValueError as exc:
-            if "not accepted" in str(exc):
-                raise
 
         allowed = any(
             hostname == domain or hostname.endswith("." + domain)
@@ -106,7 +108,7 @@ def validate_video_url(raw_url: str) -> str:
 
         return cleaned_url
 
-    except Exception as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid video URL: {exc}",
@@ -129,7 +131,9 @@ def cleanup_old_audio():
                 ):
                     path.unlink(missing_ok=True)
             except OSError:
-                logger.warning("Could not clean up cached file: %s", path.name)
+                logger.warning(
+                    "Could not clean up cached file: %s", path.name
+                )
     except OSError:
         logger.exception("Audio cache cleanup failed.")
 
@@ -153,7 +157,6 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # First inspect metadata without downloading.
             info = ydl.extract_info(url, download=False)
 
             if not info:
@@ -181,7 +184,6 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                     detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
                 )
 
-            # Download the audio to this request's temporary directory.
             ydl.download([url])
 
         candidates = [
@@ -196,12 +198,16 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 status_code=422,
                 detail=(
                     "No supported audio file was produced. "
-                    "The video may be restricted, or the platform "
+                    "The video may be restricted or the platform "
                     "may have changed its extraction requirements."
                 ),
             )
 
-        audio_path = str(max(candidates, key=lambda path: path.stat().st_size))
+        audio_file = max(
+            candidates,
+            key=lambda path: path.stat().st_size,
+        )
+        audio_path = str(audio_file)
         size = os.path.getsize(audio_path)
 
         if size == 0:
@@ -220,25 +226,41 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
 
     except HTTPException:
         raise
+
     except Exception as exc:
-        logger.exception("yt-dlp extraction failed: %s", type(exc).__name__)
+        # Log the actual exception and traceback for debugging.
+        logger.exception("yt-dlp extraction failed: %r", exc)
 
         message = str(exc).lower()
 
-        if "private" in message or "login" in message or "sign in" in message:
+        if any(term in message for term in (
+            "private video",
+            "video is private",
+            "login required",
+            "sign in to confirm",
+            "members-only",
+        )):
             detail = (
                 "This video may require login or may be private. "
                 "Try a publicly accessible video."
             )
+
         elif "unsupported url" in message:
-            detail = "This URL is not supported by the installed yt-dlp version."
-        elif any(code in message for code in ("403", "406", "forbidden")):
+            detail = (
+                "This URL is not supported by the installed yt-dlp version."
+            )
+
+        elif any(term in message for term in (
+            "403", "406", "forbidden", "http error 429",
+        )):
             detail = (
                 "The platform rejected the extraction request. "
                 "Check the Render logs for details."
             )
+
         elif "too large" in message or "max-filesize" in message:
             detail = f"Audio exceeds the {MAX_AUDIO_MB} MB limit."
+
         else:
             detail = (
                 "Audio extraction failed. Check the Render logs "
@@ -318,7 +340,10 @@ def transcribe_with_groq(audio_path: str) -> dict:
 
             raise HTTPException(
                 status_code=502,
-                detail=f"Groq transcription failed (HTTP {response.status_code}).",
+                detail=(
+                    f"Groq transcription failed "
+                    f"(HTTP {response.status_code})."
+                ),
             )
 
         result = response.json()
@@ -331,17 +356,20 @@ def transcribe_with_groq(audio_path: str) -> dict:
 
     except HTTPException:
         raise
+
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
             detail="Groq transcription timed out. Try again.",
         )
+
     except httpx.RequestError:
         logger.exception("Could not connect to Groq.")
         raise HTTPException(
             status_code=502,
             detail="Could not connect to the Groq transcription service.",
         )
+
     except Exception:
         logger.exception("Unexpected Groq response error.")
         raise HTTPException(
@@ -359,6 +387,7 @@ def health():
     return {
         "status": "ok",
         "service": "audio-extraction",
+        "version": "2.0.2",
         "platforms": [
             "YouTube",
             "TikTok",
@@ -385,8 +414,9 @@ def extract_audio(request: LinkRequest, http_request: Request):
 
     return {
         "status": "success",
-        "audio_url": str(http_request.base_url).rstrip("/")
-        + f"/audio/{token}",
+        "audio_url": (
+            str(http_request.base_url).rstrip("/") + f"/audio/{token}"
+        ),
         "title": info.get("title"),
         "duration": info.get("duration"),
         "expires_in": AUDIO_TTL_SECONDS,
