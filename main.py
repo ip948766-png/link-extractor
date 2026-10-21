@@ -123,7 +123,7 @@ def cleanup_old_audio():
 
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
     """Download audio track from supported video URL using yt-dlp."""
-    opts = {
+       opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
         "noplaylist": True,
@@ -133,12 +133,21 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         "retries": 2,
         "fragment_retries": 2,
         "max_filesize": MAX_AUDIO_BYTES,
+        
+        # ====================================================
+        # FIX: MASK AS CHROME DESKTOP WITHOUT EXT-DEPENDENCIES
+        # ====================================================
         "extractor_args": {
             "youtube": {
-                "client": ["mweb", "android"]
+                "client": ["mweb", "android"]  # Uses lighter client profiles
             }
         },
-        "impersonate": "chrome",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/webm,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
+        },
         "ignoreerrors": True
     }
 
