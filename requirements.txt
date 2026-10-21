@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 pydantic
-yt-dlp
+yt-dlp[default,curl-cffi]
