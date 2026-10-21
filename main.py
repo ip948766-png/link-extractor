@@ -1,4 +1,3 @@
-
 import os
 import re
 import uuid
@@ -13,22 +12,16 @@ from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcriber")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo")
-
 MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "24"))
 MAX_AUDIO_BYTES = MAX_AUDIO_MB * 1024 * 1024
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
@@ -63,16 +56,11 @@ AUDIO_EXTENSIONS = {
     ".ogg", ".wav", ".webm", ".flac",
 }
 
-
 class LinkRequest(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
 
-
-# --------------------------------------------------
-# URL validation
-# --------------------------------------------------
-
 def validate_video_url(raw_url: str) -> str:
+    """Validate and sanitize user-provided video link against security rules and domain whitelist."""
     cleaned_url = raw_url.strip()
 
     try:
@@ -114,12 +102,8 @@ def validate_video_url(raw_url: str) -> str:
             detail=f"Invalid video URL: {exc}",
         )
 
-
-# --------------------------------------------------
-# Temporary audio-file cleanup
-# --------------------------------------------------
-
 def cleanup_old_audio():
+    """Remove lingering temporary audio files older than the configured TTL."""
     now = time.time()
 
     try:
@@ -137,12 +121,8 @@ def cleanup_old_audio():
     except OSError:
         logger.exception("Audio cache cleanup failed.")
 
-
-# --------------------------------------------------
-# Download audio using yt-dlp
-# --------------------------------------------------
-
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
+    """Download audio track from supported video URL using yt-dlp."""
     opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -153,6 +133,13 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         "retries": 2,
         "fragment_retries": 2,
         "max_filesize": MAX_AUDIO_BYTES,
+        "extractor_args": {
+            "youtube": {
+                "client": ["mweb", "android"]
+            }
+        },
+        "impersonate": "chrome",
+        "ignoreerrors": True
     }
 
     try:
@@ -228,9 +215,7 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         raise
 
     except Exception as exc:
-        # Log the actual exception and traceback for debugging.
         logger.exception("yt-dlp extraction failed: %r", exc)
-
         message = str(exc).lower()
 
         if any(term in message for term in (
@@ -269,12 +254,8 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
 
         raise HTTPException(status_code=502, detail=detail)
 
-
-# --------------------------------------------------
-# Groq Whisper transcription
-# --------------------------------------------------
-
 def transcribe_with_groq(audio_path: str) -> dict:
+    """Send local audio stream to Groq Audio Transcriptions API."""
     if not GROQ_API_KEY:
         raise HTTPException(
             status_code=503,
@@ -282,188 +263,78 @@ def transcribe_with_groq(audio_path: str) -> dict:
         )
 
     size = os.path.getsize(audio_path)
-
     if size > MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
+            detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit for Groq upload.",
         )
 
-    filename = Path(audio_path).name
-    content_type = (
-        mimetypes.guess_type(filename)[0]
-        or "application/octet-stream"
-    )
+    mime_type, _ = mimetypes.guess_type(audio_path)
+    if not mime_type:
+        mime_type = "audio/mpeg"
 
     try:
+        filename = os.path.basename(audio_path)
+
         with open(audio_path, "rb") as audio_file:
-            response = httpx.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                },
-                data={
-                    "model": GROQ_MODEL,
-                    "response_format": "json",
-                    "temperature": "0",
-                },
-                files={
-                    "file": (filename, audio_file, content_type),
-                },
-                timeout=300.0,
-            )
+            files = {
+                "file": (filename, audio_file, mime_type)
+            }
+            data = {
+                "model": GROQ_MODEL,
+                "response_format": "json"
+            }
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            }
 
-        if response.is_error:
-            logger.error(
-                "Groq returned HTTP %s: %s",
-                response.status_code,
-                response.text[:1000],
-            )
-
-            if response.status_code == 401:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Groq rejected the API key. Check GROQ_API_KEY.",
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers=headers,
+                    data=data,
+                    files=files
                 )
 
-            if response.status_code == 413:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Groq rejected the audio because it is too large.",
-                )
+                if response.status_code != 200:
+                    logger.error("Groq API returned error: %s", response.text)
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Groq transcription failed: {response.text}"
+                    )
 
-            if response.status_code == 429:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Groq rate limit or quota reached. Try again later.",
-                )
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Groq transcription failed "
-                    f"(HTTP {response.status_code})."
-                ),
-            )
-
-        result = response.json()
-
-        return {
-            "status": "success",
-            "text": result.get("text", ""),
-            "model": GROQ_MODEL,
-        }
+                return response.json()
 
     except HTTPException:
         raise
 
-    except httpx.TimeoutException:
+    except Exception as e:
+        logger.exception("Error processing Groq transcription")
         raise HTTPException(
-            status_code=504,
-            detail="Groq transcription timed out. Try again.",
+            status_code=500,
+            detail=f"Internal Groq pipeline error: {str(e)}"
         )
-
-    except httpx.RequestError:
-        logger.exception("Could not connect to Groq.")
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to the Groq transcription service.",
-        )
-
-    except Exception:
-        logger.exception("Unexpected Groq response error.")
-        raise HTTPException(
-            status_code=502,
-            detail="Unexpected error while processing the Groq response.",
-        )
-
-
-# --------------------------------------------------
-# Routes
-# --------------------------------------------------
-
-@app.get("/")
-def health():
-    return {
-        "status": "ok",
-        "service": "audio-extraction",
-        "version": "2.0.2",
-        "platforms": [
-            "YouTube",
-            "TikTok",
-            "Instagram",
-            "Facebook",
-        ],
-    }
-
 
 @app.post("/extract-audio")
-def extract_audio(request: LinkRequest, http_request: Request):
-    """Download audio and return a temporary URL hosted by this service."""
+async def handle_extraction_and_transcription(request: LinkRequest):
+    """Main endpoint to accept video URL, extract audio, and return transcript."""
     cleanup_old_audio()
-    url = validate_video_url(request.url)
+    validated_url = validate_video_url(request.url)
 
-    with tempfile.TemporaryDirectory(prefix="extract-") as temp_dir:
-        audio_path, info = download_audio(url, temp_dir)
+    session_id = str(uuid.uuid4())
+    runtime_dir = CACHE_DIR / session_id
+    runtime_dir.mkdir(parents=True, exist_ok=True)
 
-        suffix = Path(audio_path).suffix.lower()
-        token = uuid.uuid4().hex
-        cached_path = CACHE_DIR / f"{token}{suffix}"
+    try:
+        audio_path, video_info = download_audio(validated_url, str(runtime_dir))
+        transcription_result = transcribe_with_groq(audio_path)
 
-        shutil.copyfile(audio_path, cached_path)
-
-    return {
-        "status": "success",
-        "audio_url": (
-            str(http_request.base_url).rstrip("/") + f"/audio/{token}"
-        ),
-        "title": info.get("title"),
-        "duration": info.get("duration"),
-        "expires_in": AUDIO_TTL_SECONDS,
-    }
-
-
-@app.get("/audio/{token}")
-def serve_audio(token: str):
-    if not re.fullmatch(r"[a-f0-9]{32}", token):
-        raise HTTPException(status_code=404, detail="Audio not found.")
-
-    matches = list(CACHE_DIR.glob(f"{token}.*"))
-
-    if not matches:
-        raise HTTPException(
-            status_code=404,
-            detail="Audio expired or not found. Extract the link again.",
-        )
-
-    path = matches[0]
-
-    if path.suffix.lower() not in AUDIO_EXTENSIONS:
-        raise HTTPException(status_code=404, detail="Audio not found.")
-
-    media_type = (
-        mimetypes.guess_type(path.name)[0]
-        or "application/octet-stream"
-    )
-
-    return FileResponse(
-        path=path,
-        media_type=media_type,
-        filename=path.name,
-    )
-
-
-@app.post("/transcribe-link")
-def transcribe_link(request: LinkRequest):
-    """Validate a link, download its audio, and transcribe it with Groq."""
-    cleanup_old_audio()
-    url = validate_video_url(request.url)
-
-    with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
-        audio_path, info = download_audio(url, temp_dir)
-        result = transcribe_with_groq(audio_path)
-
-        result["title"] = info.get("title")
-        result["duration"] = info.get("duration")
-
-        return result
+        return {
+            "status": "success",
+            "title": video_info.get("title", "Unknown Social Media Video"),
+            "duration": video_info.get("duration", 0),
+            "transcription": transcription_result.get("text", "")
+        }
+    finally:
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir, ignore_errors=True)
