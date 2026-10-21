@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 pydantic
---pre yt-dlp
+yt-dlp
