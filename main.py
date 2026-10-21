@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import shutil
 import logging
@@ -11,8 +12,9 @@ from urllib.parse import urlparse
 
 import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
@@ -50,15 +52,8 @@ ALLOWED_DOMAINS = {
 }
 
 AUDIO_EXTENSIONS = {
-    ".mp3",
-    ".m4a",
-    ".mp4",
-    ".mpeg",
-    ".mpga",
-    ".ogg",
-    ".wav",
-    ".webm",
-    ".flac",
+    ".mp3", ".m4a", ".mp4", ".mpeg", ".mpga",
+    ".ogg", ".wav", ".webm", ".flac",
 }
 
 
@@ -67,7 +62,7 @@ class LinkRequest(BaseModel):
 
 
 def validate_video_url(raw_url: str) -> str:
-    """Validate and sanitize user-provided video link against security rules and domain whitelist."""
+    """Validate and sanitize user provided video link."""
     cleaned_url = raw_url.strip()
 
     try:
@@ -97,7 +92,8 @@ def validate_video_url(raw_url: str) -> str:
 
         if not allowed:
             raise ValueError(
-                "Supported platforms are YouTube, TikTok, Instagram, and Facebook."
+                "Supported platforms are YouTube, TikTok, "
+                "Instagram, and Facebook."
             )
 
         return cleaned_url
@@ -110,25 +106,27 @@ def validate_video_url(raw_url: str) -> str:
 
 
 def cleanup_old_audio():
-    """Remove lingering temporary audio files older than the configured TTL."""
+    """Remove cache directories/files older than AUDIO_TTL_SECONDS."""
     now = time.time()
 
     try:
         for path in CACHE_DIR.iterdir():
             try:
-                if path.is_file() and now - path.stat().st_mtime > AUDIO_TTL_SECONDS:
+                if (
+                    path.is_file()
+                    and now - path.stat().st_mtime > AUDIO_TTL_SECONDS
+                ):
                     path.unlink(missing_ok=True)
             except OSError:
-                logger.warning("Could not clean up cached file: %s", path.name)
+                logger.warning(
+                    "Could not clean up cached file: %s", path.name
+                )
     except OSError:
         logger.exception("Audio cache cleanup failed.")
 
 
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
     """Download audio track from supported video URL using yt-dlp."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
     opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
@@ -139,13 +137,22 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         "retries": 2,
         "fragment_retries": 2,
         "max_filesize": MAX_AUDIO_BYTES,
+        
+        # ====================================================
+        # FIX: MASK AS CHROME DESKTOP WITHOUT EXT-DEPENDENCIES
+        # ====================================================
+        "extractor_args": {
+            "youtube": {
+                "client": ["mweb", "android"]  # Uses lighter client profiles
+            }
+        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/webm,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
             "Sec-Fetch-Mode": "navigate",
         },
-        "ignoreerrors": False,
+        "ignoreerrors": True
     }
 
     try:
@@ -158,24 +165,19 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                     detail="The platform did not return video information.",
                 )
 
-            if isinstance(info, dict) and info.get("_type") == "playlist":
-                entries = info.get("entries") or []
-                info = next((entry for entry in entries if isinstance(entry, dict)), None)
-
-            if not isinstance(info, dict):
-                raise HTTPException(
-                    status_code=422,
-                    detail="The platform did not return valid video information.",
-                )
-
             duration = info.get("duration")
+
             if duration and duration > MAX_DURATION_SECONDS:
                 raise HTTPException(
                     status_code=413,
                     detail="Video exceeds the configured duration limit.",
                 )
 
-            estimated_size = info.get("filesize") or info.get("filesize_approx")
+            estimated_size = (
+                info.get("filesize")
+                or info.get("filesize_approx")
+            )
+
             if estimated_size and estimated_size > MAX_AUDIO_BYTES:
                 raise HTTPException(
                     status_code=413,
@@ -185,8 +187,7 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
             ydl.download([url])
 
         candidates = [
-            path
-            for path in output_path.iterdir()
+            path for path in Path(output_dir).iterdir()
             if path.is_file()
             and path.suffix.lower() in AUDIO_EXTENSIONS
             and not path.name.endswith((".part", ".ytdl"))
@@ -202,7 +203,10 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 ),
             )
 
-        audio_file = max(candidates, key=lambda path: path.stat().st_size)
+        audio_file = max(
+            candidates,
+            key=lambda path: path.stat().st_size,
+        )
         audio_path = str(audio_file)
         size = os.path.getsize(audio_path)
 
@@ -238,15 +242,23 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 "This video may require login or may be private. "
                 "Try a publicly accessible video."
             )
+
         elif "unsupported url" in message:
-            detail = "This URL is not supported by the installed yt-dlp version."
-        elif any(term in message for term in ("403", "406", "forbidden", "http error 429")):
+            detail = (
+                "This URL is not supported by the installed yt-dlp version."
+            )
+
+        elif any(term in message for term in (
+            "403", "406", "forbidden", "http error 429",
+        )):
             detail = (
                 "The platform rejected the extraction request. "
                 "Check the Render logs for details."
             )
+
         elif "too large" in message or "max-filesize" in message:
             detail = f"Audio exceeds the {MAX_AUDIO_MB} MB limit."
+
         else:
             detail = (
                 "Audio extraction failed. Check the Render logs "
@@ -279,23 +291,30 @@ def transcribe_with_groq(audio_path: str) -> dict:
         filename = os.path.basename(audio_path)
 
         with open(audio_path, "rb") as audio_file:
-            files = {"file": (filename, audio_file, mime_type)}
-            data = {"model": GROQ_MODEL, "response_format": "json"}
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+            files = {
+                "file": (filename, audio_file, mime_type)
+            }
+            data = {
+                "model": GROQ_MODEL,
+                "response_format": "json"
+            }
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            }
 
             with httpx.Client(timeout=120.0) as client:
                 response = client.post(
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers=headers,
                     data=data,
-                    files=files,
+                    files=files
                 )
 
                 if response.status_code != 200:
                     logger.error("Groq API returned error: %s", response.text)
                     raise HTTPException(
                         status_code=502,
-                        detail=f"Groq transcription failed: {response.text}",
+                        detail=f"Groq transcription failed: {response.text}"
                     )
 
                 return response.json()
@@ -303,11 +322,11 @@ def transcribe_with_groq(audio_path: str) -> dict:
     except HTTPException:
         raise
 
-    except Exception as exc:
+    except Exception as e:
         logger.exception("Error processing Groq transcription")
         raise HTTPException(
             status_code=500,
-            detail=f"Internal Groq pipeline error: {str(exc)}",
+            detail=f"Internal Groq pipeline error: {str(e)}"
         )
 
 
@@ -329,7 +348,7 @@ async def handle_extraction_and_transcription(request: LinkRequest):
             "status": "success",
             "title": video_info.get("title", "Unknown Social Media Video"),
             "duration": video_info.get("duration", 0),
-            "transcription": transcription_result.get("text", ""),
+            "transcription": transcription_result.get("text", "")
         }
     finally:
         if runtime_dir.exists():
