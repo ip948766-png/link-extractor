@@ -22,10 +22,9 @@ def extract_audio(request: LinkRequest):
         'format': 'bestaudio/best',
         'quiet': True,
         'no_warnings': True,
-        # Force yt-dlp to natively spoof a real Chrome client
-        'impersonate': 'chrome', 
-        # Prevents getting stuck on broken formats
-        'ignoreerrors': True,    
+        # Natively force browser impersonation to clear out 406 errors
+        'impersonate': 'chrome',
+        'ignoreerrors': True,
     }
     
     try:
@@ -33,12 +32,12 @@ def extract_audio(request: LinkRequest):
             info = ydl.extract_info(request.url, download=False)
             
             if not info:
-                raise HTTPException(status_code=400, detail="Platform blocked extraction. Try a different link format.")
+                raise HTTPException(status_code=400, detail="Platform blocked connection. Try another link layout.")
                 
             raw_audio_url = info.get("url")
             
             if not raw_audio_url:
-                raise HTTPException(status_code=400, detail="Could not isolate raw streaming audio link.")
+                raise HTTPException(status_code=400, detail="Could not clean raw streaming link.")
                 
             return {"status": "success", "audio_url": raw_audio_url}
             
