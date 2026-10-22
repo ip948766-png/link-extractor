@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import logging
@@ -27,6 +26,7 @@ MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
 AUDIO_TTL_SECONDS = 1800
 
 YOUTUBE_COOKIES_BASE64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
+PROXY_URL = os.getenv("PROXY_URL", "")
 
 CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,7 +124,7 @@ def cleanup_old_audio():
 
 
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
-    """Extract the audio track without transcribing it."""
+    """Extract the audio track using yt-dlp and proxy/cookies if available."""
 
     cookiefile_path = None
 
@@ -176,6 +176,9 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         }
+
+        if PROXY_URL:
+            opts["proxy"] = PROXY_URL
 
         if cookiefile_path and os.path.exists(cookiefile_path):
             opts["cookiefile"] = cookiefile_path
@@ -252,8 +255,8 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         status_code=502,
         detail=(
             "Could not extract audio from this video. "
-            "For YouTube, try configuring YOUTUBE_COOKIES_BASE64 "
-            "in your Render environment settings."
+            "Ensure PROXY_URL or YOUTUBE_COOKIES_BASE64 "
+            "is configured in your Render environment settings."
         ),
     )
 
@@ -269,7 +272,7 @@ async def health_check():
 
 @app.post("/extract-audio")
 async def handle_audio_extraction(request: LinkRequest):
-    """Extract audio and return the file to the requesting server."""
+    """Extract audio and return the binary file stream to the requesting backend."""
 
     cleanup_old_audio()
     validated_url = validate_video_url(request.url)
