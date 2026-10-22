@@ -10,7 +10,6 @@ import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
 import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +20,11 @@ from starlette.background import BackgroundTask
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcriber")
 
-MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "24"))
+# Allow up to 100 MB by default.
+MAX_AUDIO_MB = int(os.getenv("MAX_AUDIO_MB", "100"))
 MAX_AUDIO_BYTES = MAX_AUDIO_MB * 1024 * 1024
+
+# Maximum media duration: 3 hours.
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
 AUDIO_TTL_SECONDS = 1800
 
@@ -32,7 +34,7 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Audio Extraction API", version="3.0.0")
+app = FastAPI(title="Audio Extraction API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,7 +109,7 @@ def validate_video_url(raw_url: str) -> str:
 
 
 def cleanup_old_audio():
-    """Remove old cached files and abandoned extraction directories."""
+    """Remove cached files and directories older than the retention period."""
     now = time.time()
 
     try:
@@ -125,7 +127,7 @@ def cleanup_old_audio():
 
 
 def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
-    """Extract the audio track using yt-dlp and proxy/cookies if available."""
+    """Extract audio using yt-dlp, with optional proxy and YouTube cookies."""
 
     cookiefile_path = None
 
@@ -162,7 +164,10 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
             "socket_timeout": 30,
             "retries": 3,
             "fragment_retries": 3,
+
+            # Increased from 24 MB to 100 MB.
             "max_filesize": MAX_AUDIO_BYTES,
+
             "extractor_args": {
                 "youtube": {
                     "player_client": client_list,
@@ -196,7 +201,10 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 if duration and duration > MAX_DURATION_SECONDS:
                     raise HTTPException(
                         status_code=413,
-                        detail="Video exceeds the configured duration limit.",
+                        detail=(
+                            "Video exceeds the configured "
+                            "duration limit of 3 hours."
+                        ),
                     )
 
                 estimated_size = (
@@ -204,10 +212,16 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                     or info.get("filesize_approx")
                 )
 
-                if estimated_size and estimated_size > MAX_AUDIO_BYTES:
+                if (
+                    estimated_size is not None
+                    and estimated_size > MAX_AUDIO_BYTES
+                ):
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
+                        detail=(
+                            f"Extracted audio exceeds the "
+                            f"{MAX_AUDIO_MB} MB limit."
+                        ),
                     )
 
                 ydl.download([url])
@@ -230,11 +244,19 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
                 size = audio_file.stat().st_size
 
                 if size <= MAX_AUDIO_BYTES:
+                    logger.info(
+                        "Extracted audio: %s (%.2f MB)",
+                        audio_file.name,
+                        size / (1024 * 1024),
+                    )
                     return str(audio_file), info
 
                 raise HTTPException(
                     status_code=413,
-                    detail=f"Audio exceeds the {MAX_AUDIO_MB} MB limit.",
+                    detail=(
+                        f"Extracted audio exceeds the "
+                        f"{MAX_AUDIO_MB} MB limit."
+                    ),
                 )
 
         except HTTPException:
@@ -256,8 +278,8 @@ def download_audio(url: str, output_dir: str) -> tuple[str, dict]:
         status_code=502,
         detail=(
             "Could not extract audio from this video. "
-            "Ensure PROXY_URL or YOUTUBE_COOKIES_BASE64 "
-            "is configured in your Render environment settings."
+            "For YouTube, check PROXY_URL or "
+            "YOUTUBE_COOKIES_BASE64 in Render settings."
         ),
     )
 
@@ -267,13 +289,14 @@ async def health_check():
     return {
         "status": "ok",
         "service": "Audio Extraction API",
-        "version": "3.0.0",
+        "version": "3.1.0",
+        "max_audio_mb": MAX_AUDIO_MB,
     }
 
 
 @app.post("/extract-audio")
 async def handle_audio_extraction(request: LinkRequest):
-    """Extract audio and return the binary file stream to the requesting backend."""
+    """Extract audio and return the audio file to the main backend."""
 
     cleanup_old_audio()
     validated_url = validate_video_url(request.url)
@@ -290,15 +313,18 @@ async def handle_audio_extraction(request: LinkRequest):
         audio_file = Path(audio_path)
         mime_type, _ = mimetypes.guess_type(audio_file.name)
 
-        if not mime_type or not mime_type.startswith("audio/"):
+        if not mime_type or not (
+            mime_type.startswith("audio/")
+            or mime_type.startswith("video/")
+        ):
             mime_type = "application/octet-stream"
 
         duration = video_info.get("duration") or 0
 
         logger.info(
-            "Audio extracted successfully: file=%s size=%s duration=%s",
+            "Returning audio file: %s, size=%.2f MB, duration=%s seconds",
             audio_file.name,
-            audio_file.stat().st_size,
+            audio_file.stat().st_size / (1024 * 1024),
             duration,
         )
 
