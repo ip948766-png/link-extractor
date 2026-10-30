@@ -143,23 +143,26 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
 
     if YOUTUBE_COOKIES_BASE64:
         try:
-            cookie_data = base64.b64decode(
-                YOUTUBE_COOKIES_BASE64,
-                validate=True,
-            ).decode("utf-8")
+            # Clean and sanitize base64 string
+            cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+            cookie_bytes = base64.b64decode(cleaned_b64)
+            cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
 
-            cookiefile_path = os.path.join(output_dir, "cookies.txt")
-
-            with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
-                cookie_file.write(cookie_data)
+            if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
+                cookiefile_path = os.path.join(output_dir, "cookies.txt")
+                with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
+                    cookie_file.write(cookie_data)
+                logger.info("Successfully initialized YouTube cookie session.")
+            else:
+                logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
 
         except Exception as exc:
             logger.warning("Could not load YouTube cookies: %s", exc)
 
     client_strategies = [
-        ["android", "ios"],
-        ["tv", "tv_embedded"],
-        ["mweb", "web_creator"],
+        ["mweb", "android"],
+        ["ios", "web_embedded"],
+        ["tv_embedded", "android_vr"],
     ]
 
     last_exception = None
@@ -179,12 +182,13 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
             "extractor_args": {
                 "youtube": {
                     "player_client": client_list,
-                    "player_skip": ["webpage", "configs"],
+                    "skip": ["webpage"],
                 }
             },
             "http_headers": {
                 "User-Agent": (
-                    "com.google.android.youtube/19.29.37 (Linux; U; Android 11; en_US)"
+                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             },
@@ -289,15 +293,16 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
 
     if YOUTUBE_COOKIES_BASE64:
         try:
-            cookie_data = base64.b64decode(
-                YOUTUBE_COOKIES_BASE64,
-                validate=True,
-            ).decode("utf-8")
+            cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+            cookie_bytes = base64.b64decode(cleaned_b64)
+            cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
 
-            cookiefile_path = os.path.join(output_dir, "cookies.txt")
-
-            with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
-                cookie_file.write(cookie_data)
+            if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
+                cookiefile_path = os.path.join(output_dir, "cookies.txt")
+                with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
+                    cookie_file.write(cookie_data)
+            else:
+                logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
 
         except Exception as exc:
             logger.warning("Could not load YouTube cookies: %s", exc)
@@ -308,9 +313,9 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
         format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
     client_strategies = [
-        ["android", "ios"],
-        ["tv", "tv_embedded"],
-        ["mweb", "web_creator"],
+        ["mweb", "android"],
+        ["ios", "web_embedded"],
+        ["tv_embedded", "android_vr"],
     ]
 
     last_exception = None
@@ -331,12 +336,13 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
             "extractor_args": {
                 "youtube": {
                     "player_client": client_list,
-                    "player_skip": ["webpage", "configs"],
+                    "skip": ["webpage"],
                 }
             },
             "http_headers": {
                 "User-Agent": (
-                    "com.google.android.youtube/19.29.37 (Linux; U; Android 11; en_US)"
+                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             },
