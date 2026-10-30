@@ -222,9 +222,9 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
     out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     client_strategies = [
-        ["tv_embedded", "android_vr"],
         ["mweb", "android"],
-        ["ios", "web_embedded"],
+        ["ios", "web_creator"],
+        ["tv_embedded", "android_vr"],
     ]
 
     last_exception = None
@@ -233,7 +233,6 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
         opts = {
             "format": format_spec,
             "outtmpl": out_template,
-            "max_filesize": max_bytes,
             "quiet": True,
             "no_warnings": True,
             "merge_output_format": "mp4",
@@ -270,7 +269,7 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
                         os.remove(target_file)
                         raise HTTPException(
                             status_code=413,
-                            detail=f"Video size exceeds maximum allowed limit for {plan.upper()} tier ({max_mb}MB).",
+                            detail=f"Video size ({round(file_size / (1024*1024), 2)}MB) exceeds maximum allowed limit for {plan.upper()} tier ({max_mb}MB).",
                         )
                     metadata = {
                         "title": info.get("title", "Video Track"),
