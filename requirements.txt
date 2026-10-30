@@ -2,5 +2,5 @@ fastapi
 uvicorn
 pydantic
 httpx
-yt-dlp>=2025.1.1
+yt-dlp[default]
 curl_cffi
