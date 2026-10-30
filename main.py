@@ -34,6 +34,9 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Shared cookie file location across requests
+COOKIE_FILE_PATH = CACHE_DIR / "youtube_cookies.txt"
+
 app = FastAPI(title="Audio Extraction API", version="3.2.0")
 
 app.add_middleware(
@@ -122,6 +125,8 @@ def cleanup_old_audio():
     try:
         for path in CACHE_DIR.iterdir():
             try:
+                if path.name == "youtube_cookies.txt":
+                    continue
                 if now - path.stat().st_mtime > AUDIO_TTL_SECONDS:
                     if path.is_dir():
                         shutil.rmtree(path, ignore_errors=True)
@@ -133,31 +138,40 @@ def cleanup_old_audio():
         logger.exception("Audio cache cleanup failed.")
 
 
+def get_cookie_file_path() -> str | None:
+    """Decode and write YOUTUBE_COOKIES_BASE64 to a stable cache file if valid."""
+    if not YOUTUBE_COOKIES_BASE64:
+        return None
+
+    if COOKIE_FILE_PATH.exists() and COOKIE_FILE_PATH.stat().st_size > 0:
+        return str(COOKIE_FILE_PATH)
+
+    try:
+        # Strip all formatting artifacts from environment variable string
+        cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
+        cookie_bytes = base64.b64decode(cleaned_b64)
+        cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
+
+        if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
+            with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as cookie_file:
+                cookie_file.write(cookie_data)
+            logger.info("Successfully initialized YouTube cookie session.")
+            return str(COOKIE_FILE_PATH)
+        else:
+            logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
+    except Exception as exc:
+        logger.warning("Could not load YouTube cookies: %s", exc)
+
+    return None
+
+
 def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, dict]:
     """Extract audio using yt-dlp, enforcing plan tier size limits."""
 
     max_mb = PRO_LIMIT_MB if plan.lower() == "pro" else FREE_LIMIT_MB
     max_bytes = max_mb * 1024 * 1024
 
-    cookiefile_path = None
-
-    if YOUTUBE_COOKIES_BASE64:
-        try:
-            # Clean and sanitize base64 string
-            cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
-            cookie_bytes = base64.b64decode(cleaned_b64)
-            cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
-
-            if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
-                cookiefile_path = os.path.join(output_dir, "cookies.txt")
-                with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
-                    cookie_file.write(cookie_data)
-                logger.info("Successfully initialized YouTube cookie session.")
-            else:
-                logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
-
-        except Exception as exc:
-            logger.warning("Could not load YouTube cookies: %s", exc)
+    cookiefile_path = get_cookie_file_path()
 
     client_strategies = [
         ["mweb", "android"],
@@ -182,7 +196,6 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
             "extractor_args": {
                 "youtube": {
                     "player_client": client_list,
-                    "skip": ["webpage"],
                 }
             },
             "http_headers": {
@@ -289,23 +302,7 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
     max_mb = PRO_LIMIT_MB if plan.lower() == "pro" else FREE_LIMIT_MB
     max_bytes = max_mb * 1024 * 1024
 
-    cookiefile_path = None
-
-    if YOUTUBE_COOKIES_BASE64:
-        try:
-            cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
-            cookie_bytes = base64.b64decode(cleaned_b64)
-            cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
-
-            if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
-                cookiefile_path = os.path.join(output_dir, "cookies.txt")
-                with open(cookiefile_path, "w", encoding="utf-8") as cookie_file:
-                    cookie_file.write(cookie_data)
-            else:
-                logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
-
-        except Exception as exc:
-            logger.warning("Could not load YouTube cookies: %s", exc)
+    cookiefile_path = get_cookie_file_path()
 
     if quality in ["360", "480", "720", "1080"]:
         format_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
@@ -336,7 +333,6 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
             "extractor_args": {
                 "youtube": {
                     "player_client": client_list,
-                    "skip": ["webpage"],
                 }
             },
             "http_headers": {
