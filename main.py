@@ -223,9 +223,9 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
     logger.info("YouTube proxy configured: %s", bool(PROXY_URL))
 
     if quality in ["360", "480", "720", "1080"]:
-        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/bestvideo+bestaudio/best"
+        format_spec = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best[ext=mp4]/best"
     else:
-        format_spec = "bestvideo+bestaudio/best"
+        format_spec = "best[ext=mp4]/best"
 
     out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
