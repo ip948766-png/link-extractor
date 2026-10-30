@@ -223,15 +223,16 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
     logger.info("YouTube proxy configured: %s", bool(PROXY_URL))
 
     if quality in ["360", "480", "720", "1080"]:
-        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/bestvideo+bestaudio/best"
     else:
         format_spec = "bestvideo+bestaudio/best"
 
     out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     client_strategies = [
-        ["mweb", "android"],
-        ["ios", "web_creator"],
+        ["android", "mweb"],
+        ["android_creator", "ios"],
+        ["web", "web_embedded"],
         ["tv_embedded", "android_vr"],
     ]
 
