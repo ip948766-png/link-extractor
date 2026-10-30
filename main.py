@@ -1,147 +1,48 @@
 import os
-import shutil
-import logging
-import tempfile
-import ipaddress
-import mimetypes
-import time
 import base64
-from pathlib import Path
-from urllib.parse import urlparse
-
-import httpx
+import logging
+import pathlib
+import shutil
+import time
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, HttpUrl
 import yt_dlp
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
+# Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcriber")
 
-# Plan tier size limits in MB
-FREE_LIMIT_MB = int(os.getenv("FREE_LIMIT_MB", "25"))
-PRO_LIMIT_MB = int(os.getenv("PRO_LIMIT_MB", "5120"))  # 5 GB
+app = FastAPI(title="Media Downloader & Audio Extractor API", version="1.0.0")
 
-# Maximum media duration: 3 hours.
-MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "10800"))
-AUDIO_TTL_SECONDS = 1800
+# Directories
+TEMP_DIR = pathlib.Path("/tmp/media_downloads")
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-YOUTUBE_COOKIES_BASE64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
-PROXY_URL = os.getenv("PROXY_URL", "")
-
-CACHE_DIR = Path(tempfile.gettempdir()) / "transcriber-audio-cache"
+CACHE_DIR = pathlib.Path("/tmp/yt_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Shared cookie file location across requests
 COOKIE_FILE_PATH = CACHE_DIR / "youtube_cookies.txt"
 
-app = FastAPI(title="Audio Extraction API", version="3.2.0")
+# Configuration
+YOUTUBE_COOKIES_BASE64 = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
-)
+FREE_LIMIT_MB = 25
+PRO_LIMIT_MB = 5000
 
-ALLOWED_DOMAINS = {
-    "youtube.com",
-    "youtube-nocookie.com",
-    "youtu.be",
-    "tiktok.com",
-    "instagram.com",
-    "instagr.am",
-    "facebook.com",
-    "fb.watch",
-}
-
-AUDIO_EXTENSIONS = {
-    ".mp3", ".m4a", ".mp4", ".mpeg", ".mpga",
-    ".ogg", ".wav", ".webm", ".flac",
-}
+# Cleanup interval (1 hour)
+CLEANUP_THRESHOLD_SECONDS = 3600
 
 
-class LinkRequest(BaseModel):
-    url: str = Field(min_length=8, max_length=4096)
-    plan: str = Field(default="free", description="User tier: 'free' (25MB limit) or 'pro' (5GB limit)")
-
-
-class VideoDownloadRequest(BaseModel):
-    url: str = Field(min_length=8, max_length=4096)
-    quality: str = Field(default="720", description="Preferred quality: 360, 480, 720, 1080, or best")
-    plan: str = Field(default="free", description="User tier: 'free' (25MB limit) or 'pro' (5GB limit)")
-
-
-def validate_video_url(raw_url: str) -> str:
-    cleaned_url = raw_url.strip()
-
-    try:
-        parsed = urlparse(cleaned_url)
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-
-        if parsed.scheme != "https":
-            raise ValueError("Only HTTPS links are accepted.")
-
-        if not hostname or parsed.username or parsed.password:
-            raise ValueError("Invalid URL.")
-
-        if parsed.port not in (None, 443):
-            raise ValueError("Unsupported URL port.")
-
-        try:
-            ipaddress.ip_address(hostname)
-        except ValueError:
-            pass
-        else:
-            raise ValueError("IP-address URLs are not accepted.")
-
-        allowed = any(
-            hostname == domain or hostname.endswith("." + domain)
-            for domain in ALLOWED_DOMAINS
-        )
-
-        if not allowed:
-            raise ValueError(
-                "Supported platforms are YouTube, TikTok, "
-                "Instagram, and Facebook."
-            )
-
-        return cleaned_url
-
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid video URL: {exc}",
-        )
-
-
-def cleanup_old_audio():
-    """Remove cached files and directories older than the retention period."""
-    now = time.time()
-
-    try:
-        for path in CACHE_DIR.iterdir():
-            try:
-                if path.name == "youtube_cookies.txt":
-                    continue
-                if now - path.stat().st_mtime > AUDIO_TTL_SECONDS:
-                    if path.is_dir():
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("Could not clean up: %s", path.name)
-    except OSError:
-        logger.exception("Audio cache cleanup failed.")
-
-
-def get_cookie_file_path() -> str | None:
-    """Initialize the YouTube cookie file from the current environment variable."""
+def get_cookie_file_path() -> Optional[str]:
+    """
+    Initialize the YouTube cookie file from the current environment variable.
+    Overwrites the file dynamically so env updates take immediate effect.
+    """
     if not YOUTUBE_COOKIES_BASE64:
-        logger.warning("YouTube cookies are not configured.")
+        logger.warning("YouTube cookies are not configured in environment variables.")
         return None
 
     try:
@@ -153,21 +54,22 @@ def get_cookie_file_path() -> str | None:
             "# Netscape HTTP Cookie File" in cookie_data
             or "# HTTP Cookie File" in cookie_data
         ):
-            logger.warning("YouTube cookie file has an unexpected format.")
+            logger.warning("YouTube cookie file does not match Netscape format header.")
             return None
 
         if not any(
             domain in cookie_data
             for domain in [".youtube.com", "youtube.com", ".google.com"]
         ):
-            logger.warning("Cookie file does not contain expected YouTube domains.")
+            logger.warning("Cookie file does not contain expected YouTube or Google domains.")
             return None
 
         COOKIE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
         COOKIE_FILE_PATH.write_text(cookie_data, encoding="utf-8")
+
         logger.info(
             "YouTube cookies loaded successfully. File size: %s bytes",
-            COOKIE_FILE_PATH.stat().st_size
+            COOKIE_FILE_PATH.stat().st_size,
         )
         return str(COOKIE_FILE_PATH)
     except Exception as exc:
@@ -175,13 +77,46 @@ def get_cookie_file_path() -> str | None:
         return None
 
 
+def cleanup_old_files():
+    """Background task to remove files older than 1 hour."""
+    now = time.time()
+    for item in TEMP_DIR.glob("*"):
+        if item.is_file() and (now - item.stat().st_mtime > CLEANUP_THRESHOLD_SECONDS):
+            try:
+                item.unlink()
+                logger.info("Cleaned up old file: %s", item)
+            except Exception as e:
+                logger.error("Failed to delete %s: %s", item, e)
+        elif item.is_dir() and (now - item.stat().st_mtime > CLEANUP_THRESHOLD_SECONDS):
+            try:
+                shutil.rmtree(item)
+                logger.info("Cleaned up old directory: %s", item)
+            except Exception as e:
+                logger.error("Failed to delete directory %s: %s", item, e)
+
+
+class ExtractAudioRequest(BaseModel):
+    url: HttpUrl
+
+
+class DownloadVideoRequest(BaseModel):
+    url: HttpUrl
+    quality: Optional[str] = "720"
+
+
 def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, dict]:
     """Extract audio using yt-dlp, enforcing plan tier size limits."""
-
     max_mb = PRO_LIMIT_MB if plan.lower() == "pro" else FREE_LIMIT_MB
     max_bytes = max_mb * 1024 * 1024
 
     cookiefile_path = get_cookie_file_path()
+
+    logger.info("YouTube cookie file exists: %s", bool(cookiefile_path and os.path.isfile(cookiefile_path)))
+    logger.info(
+        "YouTube cookie file size: %s",
+        os.path.getsize(cookiefile_path) if cookiefile_path and os.path.isfile(cookiefile_path) else 0,
+    )
+    logger.info("YouTube proxy configured: %s", bool(PROXY_URL))
 
     client_strategies = [
         ["mweb", "android"],
@@ -189,135 +124,94 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
         ["tv_embedded", "android_vr"],
     ]
 
+    out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     last_exception = None
 
-    for client_list in client_strategies:
+    for clients in client_strategies:
         opts = {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-            "noplaylist": True,
+            "outtmpl": out_template,
+            "max_filesize": max_bytes,
             "quiet": True,
             "no_warnings": True,
-            "socket_timeout": 30,
-            "retries": 5,
-            "fragment_retries": 5,
-            "geo_bypass": True,
-            "max_filesize": max_bytes,
+            "extract_flat": False,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
             "extractor_args": {
                 "youtube": {
-                    "player_client": client_list,
+                    "player_client": clients,
                 }
             },
             "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
             },
         }
-
-        if PROXY_URL:
-            opts["proxy"] = PROXY_URL
 
         if cookiefile_path and os.path.exists(cookiefile_path):
             opts["cookiefile"] = cookiefile_path
 
+        if PROXY_URL:
+            opts["proxy"] = PROXY_URL
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(url, download=True)
+                filename = ytdl.prepare_filename(info)
+                # Convert extension to mp3 due to FFmpeg postprocessing
+                base_name, _ = os.path.splitext(filename)
+                mp3_filename = base_name + ".mp3"
 
-                if not info:
-                    continue
-
-                duration = info.get("duration")
-
-                if duration and duration > MAX_DURATION_SECONDS:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the configured duration limit of 3 hours.",
-                    )
-
-                estimated_size = (
-                    info.get("filesize")
-                    or info.get("filesize_approx")
-                )
-
-                if estimated_size and estimated_size > max_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Audio exceeds your {max_mb} MB plan limit.",
-                    )
-
-                ydl.download([url])
-
-            candidates = [
-                path
-                for path in Path(output_dir).iterdir()
-                if path.is_file()
-                and path.suffix.lower() in AUDIO_EXTENSIONS
-                and not path.name.endswith((".part", ".ytdl"))
-                and path.name != "cookies.txt"
-                and path.stat().st_size > 0
-            ]
-
-            if candidates:
-                audio_file = max(
-                    candidates,
-                    key=lambda path: path.stat().st_size,
-                )
-                size = audio_file.stat().st_size
-
-                if size <= max_bytes:
-                    logger.info(
-                        "Extracted audio: %s (%.2f MB)",
-                        audio_file.name,
-                        size / (1024 * 1024),
-                    )
-                    return str(audio_file), info
-
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Extracted audio exceeds your {max_mb} MB plan limit.",
-                )
-
+                if os.path.exists(mp3_filename):
+                    file_size = os.path.getsize(mp3_filename)
+                    if file_size > max_bytes:
+                        os.remove(mp3_filename)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Extracted audio size exceeds maximum allowed for {plan.upper()} tier ({max_mb}MB).",
+                        )
+                    metadata = {
+                        "title": info.get("title", "Audio Track"),
+                        "duration": info.get("duration"),
+                        "uploader": info.get("uploader"),
+                    }
+                    return mp3_filename, metadata
         except HTTPException:
             raise
-        except Exception as exc:
-            last_exception = exc
-            logger.warning(
-                "yt-dlp strategy %s failed: %r",
-                client_list,
-                exc,
-            )
-
-    logger.error(
-        "All audio extraction strategies failed: %r",
-        last_exception,
-    )
+        except Exception as err:
+            logger.warning("yt-dlp strategy %s failed: %r", clients, err)
+            last_exception = err
 
     raise HTTPException(
         status_code=502,
-        detail=(
-            "Could not extract audio from this video. "
-            "For YouTube, check PROXY_URL or "
-            "YOUTUBE_COOKIES_BASE64 in Render settings."
-        ),
+        detail=f"Could not extract audio track from media link: {last_exception}",
     )
 
 
 def download_video_file(url: str, output_dir: str, quality: str = "720", plan: str = "free") -> tuple[str, dict]:
     """Download a video file (MP4) with audio combined, enforcing tier size limits."""
-
     max_mb = PRO_LIMIT_MB if plan.lower() == "pro" else FREE_LIMIT_MB
     max_bytes = max_mb * 1024 * 1024
 
     cookiefile_path = get_cookie_file_path()
 
+    logger.info("YouTube cookie file exists: %s", bool(cookiefile_path and os.path.isfile(cookiefile_path)))
+    logger.info(
+        "YouTube cookie file size: %s",
+        os.path.getsize(cookiefile_path) if cookiefile_path and os.path.isfile(cookiefile_path) else 0,
+    )
+    logger.info("YouTube proxy configured: %s", bool(PROXY_URL))
+
     if quality in ["360", "480", "720", "1080"]:
-        format_str = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
+        format_spec = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
     else:
-        format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
+    out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     client_strategies = [
         ["mweb", "android"],
@@ -327,216 +221,126 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
 
     last_exception = None
 
-    for client_list in client_strategies:
+    for clients in client_strategies:
         opts = {
-            "format": format_str,
-            "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
-            "noplaylist": True,
+            "format": format_spec,
+            "outtmpl": out_template,
+            "max_filesize": max_bytes,
             "quiet": True,
             "no_warnings": True,
-            "socket_timeout": 30,
-            "retries": 5,
-            "fragment_retries": 5,
-            "geo_bypass": True,
-            "max_filesize": max_bytes,
             "merge_output_format": "mp4",
             "extractor_args": {
                 "youtube": {
-                    "player_client": client_list,
+                    "player_client": clients,
                 }
             },
             "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
             },
         }
-
-        if PROXY_URL:
-            opts["proxy"] = PROXY_URL
 
         if cookiefile_path and os.path.exists(cookiefile_path):
             opts["cookiefile"] = cookiefile_path
 
+        if PROXY_URL:
+            opts["proxy"] = PROXY_URL
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(url, download=True)
+                filename = ytdl.prepare_filename(info)
 
-                if not info:
-                    continue
+                # Ensure filename ends with mp4 after merging
+                base_name, _ = os.path.splitext(filename)
+                mp4_filename = base_name + ".mp4"
 
-                duration = info.get("duration")
-                if duration and duration > MAX_DURATION_SECONDS:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the configured duration limit of 3 hours.",
-                    )
+                target_file = mp4_filename if os.path.exists(mp4_filename) else filename
 
-                estimated_size = (
-                    info.get("filesize")
-                    or info.get("filesize_approx")
-                )
-
-                if estimated_size and estimated_size > max_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Video exceeds your {max_mb} MB plan limit.",
-                    )
-
-                ydl.download([url])
-
-            candidates = [
-                path
-                for path in Path(output_dir).iterdir()
-                if path.is_file()
-                and path.suffix.lower() in [".mp4", ".mkv", ".webm"]
-                and not path.name.endswith((".part", ".ytdl"))
-                and path.name != "cookies.txt"
-                and path.stat().st_size > 0
-            ]
-
-            if candidates:
-                video_file = max(
-                    candidates,
-                    key=lambda path: path.stat().st_size,
-                )
-                if video_file.stat().st_size <= max_bytes:
-                    return str(video_file), info
-
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Downloaded video exceeds your {max_mb} MB plan limit.",
-                )
-
+                if os.path.exists(target_file):
+                    file_size = os.path.getsize(target_file)
+                    if file_size > max_bytes:
+                        os.remove(target_file)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Video size exceeds maximum allowed limit for {plan.upper()} tier ({max_mb}MB).",
+                        )
+                    metadata = {
+                        "title": info.get("title", "Video Track"),
+                        "duration": info.get("duration"),
+                        "resolution": info.get("resolution"),
+                        "uploader": info.get("uploader"),
+                    }
+                    return target_file, metadata
         except HTTPException:
             raise
-        except Exception as exc:
-            last_exception = exc
-            logger.warning("yt-dlp video strategy %s failed: %r", client_list, exc)
+        except Exception as err:
+            logger.warning("yt-dlp video strategy %s failed: %r", clients, err)
+            last_exception = err
 
     raise HTTPException(
         status_code=502,
-        detail="Could not download video. Check PROXY_URL or YOUTUBE_COOKIES_BASE64 in Render settings.",
+        detail=f"Could not download video file from link: {last_exception}",
     )
 
 
-@app.get("/")
-async def health_check():
-    return {
-        "status": "ok",
-        "service": "Audio Extraction API",
-        "version": "3.2.0",
-        "free_limit_mb": FREE_LIMIT_MB,
-        "pro_limit_mb": PRO_LIMIT_MB,
-    }
-
-
 @app.post("/extract-audio")
-async def handle_audio_extraction(request: LinkRequest):
-    """Extract audio and return the audio file to the main backend."""
+async def extract_audio_endpoint(
+    req: ExtractAudioRequest,
+    background_tasks: BackgroundTasks,
+    x_user_plan: Optional[str] = Header(default="free"),
+):
+    """API endpoint to extract audio from video link."""
+    background_tasks.add_task(cleanup_old_files)
+    session_dir = TEMP_DIR / f"session_{int(time.time() * 1000)}"
+    session_dir.mkdir(parents=True, exist_ok=True)
 
-    cleanup_old_audio()
-    validated_url = validate_video_url(request.url)
+    file_path, metadata = download_audio(str(req.url), str(session_dir), plan=x_user_plan)
 
-    session_dir = CACHE_DIR / os.urandom(16).hex()
-    session_dir.mkdir(parents=True, exist_ok=False)
-
-    try:
-        audio_path, video_info = download_audio(
-            validated_url,
-            str(session_dir),
-            plan=request.plan,
-        )
-
-        audio_file = Path(audio_path)
-        mime_type, _ = mimetypes.guess_type(audio_file.name)
-
-        if not mime_type or not (
-            mime_type.startswith("audio/")
-            or mime_type.startswith("video/")
-        ):
-            mime_type = "application/octet-stream"
-
-        duration = video_info.get("duration") or 0
-
-        logger.info(
-            "Returning audio file: %s, size=%.2f MB, duration=%s seconds",
-            audio_file.name,
-            audio_file.stat().st_size / (1024 * 1024),
-            duration,
-        )
-
-        return FileResponse(
-            path=str(audio_file),
-            media_type=mime_type,
-            filename=audio_file.name,
-            headers={
-                "X-Video-Duration": str(duration),
-                "X-Audio-Extraction-Status": "success",
-            },
-            background=BackgroundTask(
-                shutil.rmtree,
-                str(session_dir),
-                ignore_errors=True,
-            ),
-        )
-
-    except Exception:
-        shutil.rmtree(session_dir, ignore_errors=True)
-        raise
+    filename = os.path.basename(file_path)
+    return FileResponse(
+        path=file_path,
+        media_type="audio/mpeg",
+        filename=filename,
+        headers={
+            "X-Media-Title": metadata.get("title", ""),
+            "X-Media-Duration": str(metadata.get("duration", "")),
+        },
+    )
 
 
 @app.post("/download-video")
-async def handle_video_download(request: VideoDownloadRequest):
-    """Download video and stream the MP4 file to the client."""
+async def download_video_endpoint(
+    req: DownloadVideoRequest,
+    background_tasks: BackgroundTasks,
+    x_user_plan: Optional[str] = Header(default="free"),
+):
+    """API endpoint to download full video file."""
+    background_tasks.add_task(cleanup_old_files)
+    session_dir = TEMP_DIR / f"session_{int(time.time() * 1000)}"
+    session_dir.mkdir(parents=True, exist_ok=True)
 
-    cleanup_old_audio()
-    validated_url = validate_video_url(request.url)
+    file_path, metadata = download_video_file(
+        str(req.url), str(session_dir), quality=req.quality, plan=x_user_plan
+    )
 
-    session_dir = CACHE_DIR / os.urandom(16).hex()
-    session_dir.mkdir(parents=True, exist_ok=False)
+    filename = os.path.basename(file_path)
+    return FileResponse(
+        path=file_path,
+        media_type="video/mp4",
+        filename=filename,
+        headers={
+            "X-Media-Title": metadata.get("title", ""),
+            "X-Media-Duration": str(metadata.get("duration", "")),
+        },
+    )
 
-    try:
-        video_path, video_info = download_video_file(
-            validated_url,
-            str(session_dir),
-            quality=request.quality,
-            plan=request.plan,
-        )
 
-        video_file = Path(video_path)
-        mime_type, _ = mimetypes.guess_type(video_file.name)
-        if not mime_type:
-            mime_type = "video/mp4"
-
-        duration = video_info.get("duration") or 0
-        title = video_info.get("title") or "video"
-
-        logger.info(
-            "Returning video file: %s, size=%.2f MB, duration=%s seconds",
-            video_file.name,
-            video_file.stat().st_size / (1024 * 1024),
-            duration,
-        )
-
-        return FileResponse(
-            path=str(video_file),
-            media_type=mime_type,
-            filename=f"{title}.mp4",
-            headers={
-                "X-Video-Duration": str(duration),
-                "X-Video-Title": title,
-                "X-Video-Download-Status": "success",
-            },
-            background=BackgroundTask(
-                shutil.rmtree,
-                str(session_dir),
-                ignore_errors=True,
-            ),
-        )
-
-    except Exception:
-        shutil.rmtree(session_dir, ignore_errors=True)
-        raise
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    cookie_status = bool(COOKIE_FILE_PATH.exists() and COOKIE_FILE_PATH.stat().st_size > 0)
+    return {
+        "status": "healthy",
+        "proxy_enabled": bool(PROXY_URL),
+        "cookies_loaded": cookie_status,
+    }
