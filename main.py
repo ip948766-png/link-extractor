@@ -175,7 +175,6 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
             "retries": 5,
             "fragment_retries": 5,
             "geo_bypass": True,
-            "impersonate": "chrome",
             "max_filesize": max_bytes,
             "extractor_args": {
                 "youtube": {
@@ -327,7 +326,6 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
             "retries": 5,
             "fragment_retries": 5,
             "geo_bypass": True,
-            "impersonate": "chrome",
             "max_filesize": max_bytes,
             "merge_output_format": "mp4",
             "extractor_args": {
