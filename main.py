@@ -139,30 +139,40 @@ def cleanup_old_audio():
 
 
 def get_cookie_file_path() -> str | None:
-    """Decode and write YOUTUBE_COOKIES_BASE64 to a stable cache file if valid."""
+    """Initialize the YouTube cookie file from the current environment variable."""
     if not YOUTUBE_COOKIES_BASE64:
+        logger.warning("YouTube cookies are not configured.")
         return None
 
-    if COOKIE_FILE_PATH.exists() and COOKIE_FILE_PATH.stat().st_size > 0:
-        return str(COOKIE_FILE_PATH)
-
     try:
-        # Strip all formatting artifacts from environment variable string
-        cleaned_b64 = YOUTUBE_COOKIES_BASE64.strip().replace(" ", "").replace("\n", "").replace("\r", "")
-        cookie_bytes = base64.b64decode(cleaned_b64)
-        cookie_data = cookie_bytes.decode("utf-8", errors="ignore")
+        cleaned_b64 = "".join(YOUTUBE_COOKIES_BASE64.split())
+        cookie_bytes = base64.b64decode(cleaned_b64, validate=True)
+        cookie_data = cookie_bytes.decode("utf-8")
 
-        if "# Netscape HTTP Cookie File" in cookie_data or "youtube.com" in cookie_data:
-            with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as cookie_file:
-                cookie_file.write(cookie_data)
-            logger.info("Successfully initialized YouTube cookie session.")
-            return str(COOKIE_FILE_PATH)
-        else:
-            logger.warning("Decoded YOUTUBE_COOKIES_BASE64 does not look like a valid cookie file.")
+        if not (
+            "# Netscape HTTP Cookie File" in cookie_data
+            or "# HTTP Cookie File" in cookie_data
+        ):
+            logger.warning("YouTube cookie file has an unexpected format.")
+            return None
+
+        if not any(
+            domain in cookie_data
+            for domain in [".youtube.com", "youtube.com", ".google.com"]
+        ):
+            logger.warning("Cookie file does not contain expected YouTube domains.")
+            return None
+
+        COOKIE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        COOKIE_FILE_PATH.write_text(cookie_data, encoding="utf-8")
+        logger.info(
+            "YouTube cookies loaded successfully. File size: %s bytes",
+            COOKIE_FILE_PATH.stat().st_size
+        )
+        return str(COOKIE_FILE_PATH)
     except Exception as exc:
-        logger.warning("Could not load YouTube cookies: %s", exc)
-
-    return None
+        logger.warning("Could not initialize YouTube cookies: %s", type(exc).__name__)
+        return None
 
 
 def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, dict]:
