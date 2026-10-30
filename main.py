@@ -104,6 +104,14 @@ class DownloadVideoRequest(BaseModel):
     quality: Optional[str] = "720"
 
 
+def sanitize_header_value(value: str) -> str:
+    """Sanitize string values so they can be safely encoded in HTTP headers (latin-1)."""
+    if not value:
+        return ""
+    # Encode to latin-1 while replacing unencodable characters (like emojis), then decode back
+    return value.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, dict]:
     """Extract audio using yt-dlp, enforcing plan tier size limits."""
     max_mb = PRO_LIMIT_MB if plan.lower() == "pro" else FREE_LIMIT_MB
@@ -207,16 +215,16 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
     logger.info("YouTube proxy configured: %s", bool(PROXY_URL))
 
     if quality in ["360", "480", "720", "1080"]:
-        format_spec = f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best"
+        format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
     else:
-        format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        format_spec = "bestvideo+bestaudio/best"
 
     out_template = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     client_strategies = [
+        ["tv_embedded", "android_vr"],
         ["mweb", "android"],
         ["ios", "web_embedded"],
-        ["tv_embedded", "android_vr"],
     ]
 
     last_exception = None
@@ -302,7 +310,7 @@ async def extract_audio_endpoint(
         media_type="audio/mpeg",
         filename=filename,
         headers={
-            "X-Media-Title": metadata.get("title", ""),
+            "X-Media-Title": sanitize_header_value(metadata.get("title", "")),
             "X-Media-Duration": str(metadata.get("duration", "")),
         },
     )
@@ -329,7 +337,7 @@ async def download_video_endpoint(
         media_type="video/mp4",
         filename=filename,
         headers={
-            "X-Media-Title": metadata.get("title", ""),
+            "X-Media-Title": sanitize_header_value(metadata.get("title", "")),
             "X-Media-Duration": str(metadata.get("duration", "")),
         },
     )
