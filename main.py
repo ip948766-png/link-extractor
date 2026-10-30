@@ -139,7 +139,6 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
         opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
-            "max_filesize": max_bytes,
             "quiet": True,
             "no_warnings": True,
             "extract_flat": False,
@@ -168,9 +167,18 @@ def download_audio(url: str, output_dir: str, plan: str = "free") -> tuple[str, 
 
         try:
             with yt_dlp.YoutubeDL(opts) as ytdl:
+                # Pre-download info extraction to check file size estimate before downloading
+                info = ytdl.extract_info(url, download=False)
+                filesize = info.get("filesize") or info.get("filesize_approx") or 0
+                if filesize > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Estimated audio size ({round(filesize / (1024*1024), 2)}MB) exceeds maximum limit for {plan.upper()} tier ({max_mb}MB).",
+                    )
+
+                # Execute actual download
                 info = ytdl.extract_info(url, download=True)
                 filename = ytdl.prepare_filename(info)
-                # Convert extension to mp3 due to FFmpeg postprocessing
                 base_name, _ = os.path.splitext(filename)
                 mp3_filename = base_name + ".mp3"
 
@@ -254,10 +262,19 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
 
         try:
             with yt_dlp.YoutubeDL(opts) as ytdl:
+                # Pre-download info extraction to check file size estimate before downloading
+                info = ytdl.extract_info(url, download=False)
+                filesize = info.get("filesize") or info.get("filesize_approx") or 0
+                if filesize > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Estimated video size ({round(filesize / (1024*1024), 2)}MB) exceeds maximum allowed limit for {plan.upper()} tier ({max_mb}MB).",
+                    )
+
+                # Execute actual download
                 info = ytdl.extract_info(url, download=True)
                 filename = ytdl.prepare_filename(info)
 
-                # Ensure filename ends with mp4 after merging
                 base_name, _ = os.path.splitext(filename)
                 mp4_filename = base_name + ".mp4"
 
