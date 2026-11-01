@@ -312,14 +312,17 @@ def download_video_file(url: str, output_dir: str, quality: str = "720", plan: s
 async def extract_audio_endpoint(
     req: ExtractAudioRequest,
     background_tasks: BackgroundTasks,
-    x_user_plan: Optional[str] = Header(default="free"),
+    plan: Optional[str] = None,
+    x_user_plan: Optional[str] = Header(default=None),
 ):
     """API endpoint to extract audio from video link."""
     background_tasks.add_task(cleanup_old_files)
     session_dir = TEMP_DIR / f"session_{int(time.time() * 1000)}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    file_path, metadata = download_audio(str(req.url), str(session_dir), plan=x_user_plan)
+    effective_plan = plan or x_user_plan or "free"
+
+    file_path, metadata = download_audio(str(req.url), str(session_dir), plan=effective_plan)
 
     filename = os.path.basename(file_path)
     return FileResponse(
@@ -337,15 +340,18 @@ async def extract_audio_endpoint(
 async def download_video_endpoint(
     req: DownloadVideoRequest,
     background_tasks: BackgroundTasks,
-    x_user_plan: Optional[str] = Header(default="free"),
+    plan: Optional[str] = None,
+    x_user_plan: Optional[str] = Header(default=None),
 ):
     """API endpoint to download full video file."""
     background_tasks.add_task(cleanup_old_files)
     session_dir = TEMP_DIR / f"session_{int(time.time() * 1000)}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    effective_plan = plan or x_user_plan or "free"
+
     file_path, metadata = download_video_file(
-        str(req.url), str(session_dir), quality=req.quality, plan=x_user_plan
+        str(req.url), str(session_dir), quality=req.quality, plan=effective_plan
     )
 
     filename = os.path.basename(file_path)
